@@ -1,0 +1,1 @@
+Part 2 of the LendingClub assignment analyzing personal loans. 
