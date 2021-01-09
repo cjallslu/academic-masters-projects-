@@ -1,0 +1,1 @@
+A collection of Python notebooks that include revenue prediction, price approximation, and price optimization. 
