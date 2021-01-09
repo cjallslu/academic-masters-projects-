@@ -1,0 +1,678 @@
+---
+title: "IDs 572 - Group Assignment 2 - CJ All, Eric Reitz, Vanessa Rodriguez"
+output: html_notebook
+
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r Cleaning data and libraries}
+rm(list = ls())
+## Libraries ####
+library(tidyverse)
+library(lubridate)
+library(rpart)
+library(caret)
+library(ROCR)
+library(dplyr)
+library(rpart.plot)
+library(C50)
+library(e1071)
+library(ranger)
+library(gbm)
+library(xgboost)
+library(ROSE)
+library(rsample)
+library(glmnet)
+library(ranger)
+library(randomForest)
+
+
+#lcdf <- read_csv('/Users/vanessarodriguez/Desktop/IDS 572/HW1/lcData5m.csv')
+lcdf <- read_csv('lcData5m.csv')
+
+# First perform data cleaning / data prep
+# Delete row with a loan status of current (not relevant to our purposes since it's still active)
+lcdf <- subset(lcdf, loan_status != "Current")
+
+#calculate the annualized percentage return
+lcdf$annRet <- ((lcdf$total_pymnt -lcdf$funded_amnt)/lcdf$funded_amnt)*(1/3)*100
+
+#Some loans are paid back early - find out the actual loan term in months
+#  Since last_pymnt_d is a chr variable, we need to covert it to a date var
+#lcdf$last_pymnt_d<-paste(lcdf$last_pymnt_d, "-01", sep = "")
+lcdf$last_pymnt_d<-parse_date_time(lcdf$last_pymnt_d,  "myd")
+lcdf$actualTerm <- ifelse(lcdf$loan_status=="Fully Paid", as.duration(lcdf$issue_d  %--% lcdf$last_pymnt_d)/dyears(1), 3)
+
+#Then, considering this actual term, we can calculate the actual annual return
+lcdf$actualReturn <- ifelse(lcdf$actualTerm>0, ((lcdf$total_pymnt - lcdf$funded_amnt)/lcdf$funded_amnt)*(1/lcdf$actualTerm),0)
+
+#Note - character variables can cause a problem with some model packages, so better to convert all of these to factors
+lcdf= lcdf %>% mutate_if(is.character, as.factor)
+
+#data leakage
+lcdf <- lcdf %>% select(-c(mths_since_recent_bc,id,member_id, 
+                           num_rev_tl_bal_gt_0,num_accts_ever_120_pd,num_actv_bc_tl,
+                           num_actv_rev_tl,pymnt_plan,title, num_tl_30dpd,num_tl_90g_dpd_24m,
+                           num_tl_op_past_12m,mths_since_recent_inq,bc_open_to_buy,application_type,
+                           total_pymnt_inv,tot_coll_amt,total_rev_hi_lim,num_tl_120dpd_2m,recoveries,tot_cur_bal,
+                           total_rec_int,out_prncp,emp_title,issue_d, num_tl_120dpd_2m,dti,chargeoff_within_12_mths,
+                           tot_hi_cred_lim,out_prncp_inv,mo_sin_old_il_acct, mo_sin_old_rev_tl_op,mo_sin_rcnt_rev_tl_op,delinq_2yrs,
+                           delinq_amnt,mo_sin_rcnt_tl, tax_liens, hardship_flag, disbursement_method,total_rec_late_fee,
+                           last_credit_pull_d,collections_12_mths_ex_med,acc_now_delinq,debt_settlement_flag,revol_util,
+                           revol_bal,earliest_cr_line, installment, collections_12_mths_ex_med,collection_recovery_fee,
+                           total_rec_prncp,total_il_high_credit_limit,total_bal_ex_mort, last_credit_pull_d, total_bc_limit,
+                           earliest_cr_line,inq_last_6mths,out_prncp_inv,out_prncp,policy_code,pct_tl_nvr_dlq, addr_state,zip_code,acc_open_past_24mths,term,emp_title))
+summary(lcdf)
+
+#Drop vars with all empty values
+lcdf <- lcdf %>% select_if(function(x){!all(is.na(x))})
+dim(lcdf)# checking dimensions
+
+#missing value proportions in each column
+colMeans(is.na(lcdf))
+
+#remove variables which have more than, for example, 60% missing values
+nm<-names(lcdf)[colMeans(is.na(lcdf))>0.6]
+lcdf <- lcdf %>% select(-nm)
+
+# Replace all NA values with the means of the columns
+colMeans(is.na(lcdf))[colMeans(is.na(lcdf))>0]
+lcdf <- lcdf %>% replace_na(list(mths_since_last_delinq = mean(lcdf$mths_since_last_delinq, na.rm = TRUE), revol_util = mean(lcdf$revol_util, na.rm = TRUE), bc_open_to_buy = mean(lcdf$bc_open_to_buy, na.rm = TRUE), bc_util = mean(lcdf$bc_util, na.rm = TRUE), mo_sin_old_il_acct = mean(lcdf$mo_sin_old_rev_tl_op, na.rm = TRUE), mths_since_recent_bc = mean(lcdf$mths_since_recent_bc, na.rm = TRUE), mths_since_recent_inq = mean(lcdf$mths_since_recent_inq, na.rm = TRUE), num_tl_120dpd_2m = mean(lcdf$num_tl_120dpd_2m, na.rm = TRUE), percent_bc_gt_75 = mean(lcdf$percent_bc_gt_75, na.rm = TRUE)))
+lcdf$last_pymnt_d <- as.factor(lcdf$last_pymnt_d)
+lcdf$int_rate<- as.numeric(sub("%","",lcdf$int_rate))
+
+```
+
+
+```{r GBM MODELS}
+#for reproducible results, set a specific value for the random number seed
+set.seed(123)
+
+# TRAINING AND TEST SUBSETS
+nr<-nrow(lcdf)
+trnIndex<- sample(1:nr, size = round(0.70*nr), replace=FALSE)
+lcdfTrn <- lcdf[trnIndex, ]
+lcdfTst <- lcdf[-trnIndex, ]
+
+# Building a gbm ####
+head(lcdf$loan_status)
+head(unclass(lcdf$loan_status)-1)
+gbm_M1 <- gbm(formula=unclass(loan_status)-1 ~.,
+              data=subset(lcdfTrn, select=-c(annRet, actualTerm, actualReturn,last_pymnt_d)),
+              distribution = "bernoulli",
+              n.trees=500, weights = ifelse(unclass(lcdfTrn$loan_status) > 0, 2, 1),shrinkage=.1,
+              interaction.depth = 2, bag.fraction=.8,cv.folds=5, n.cores=NULL)
+
+#summary(gbm_M1)
+summary(gbm_M1, cBars = 10,method = relative.influence,las = 2)
+
+#summary(gbm_M1)# shows all data
+print(gbm_M1)#shows the model with the parameters
+bestIter<-gbm.perf(gbm_M1, method='cv')
+bestIter # see best iteration
+scores_gbmM1<- predict(gbm_M1, newdata=lcdfTst, n.tree= bestIter,type="response")
+fitted.scores<-ifelse(scores_gbmM1>0,2,1)
+head(scores_gbmM1)# these are the probability for the '1' in the dependent variable
+
+#Performance - ROC
+#label.ordering here specifies the 'negative', 'positive' class labels
+pred_gbmM1=prediction(scores_gbmM1, lcdfTst$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+aucPerf_gbmM1 <-performance(pred_gbmM1, "tpr", "fpr")
+plot(aucPerf_gbmM1)
+
+#AUC value
+aucPerf_gbmM1=performance(pred_gbmM1, "auc")
+aucPerf_gbmM1@y.values
+sqrt(min(gbm_M1$cv.error))
+
+# find index for n trees with minimum CV error
+min_MSE <- which.min(gbm_M1$cv.error)
+
+# get MSE and compute RMSE
+sqrt(gbm_M1$cv.error[min_MSE])
+
+# plot loss function as a result of n trees added to the ensemble
+gbm.perf(gbm_M1, method = "cv")
+
+#confusion matrix
+predTrn=predict(gbm_M1, lcdfTrn,n.tree= bestIter, type='response')
+table(predTrn>0.7,lcdfTrn$loan_status)
+str(lcdf$loan_status)
+
+# Model 3
+gbm_M3 <- gbm(formula=unclass(loan_status)-1 ~.,
+              data=subset(lcdfTrn, select=-c(annRet, actualTerm,
+                                             actualReturn,last_pymnt_d)), distribution = "bernoulli",
+              n.trees=300, weights = ifelse(unclass(lcdfTrn$loan_status) > 0, 2, 1), shrinkage=0.1,
+              interaction.depth = 4, bag.fraction=0.5, cv.folds = 4, n.cores=10)
+summary(gbm_M3, cBars = 10,method = relative.influence,las = 2)
+
+#summary(gbm_M3)# shows all data
+print(gbm_M3)#shows the model with the parameters
+bestIter<-gbm.perf(gbm_M3, method='cv')
+bestIter # see best iteration
+scores_gbmM3<- predict(gbm_M3, newdata=lcdfTst, n.tree= bestIter,type="response")
+fitted.scores<-ifelse(scores_gbmM3>0,2,1)
+head(scores_gbmM3)# these are the probability for the '1' in the dependent variable
+#Performance - ROC
+#label.ordering here specifies the 'negative', 'positive' class labels
+pred_gbmM3=prediction(scores_gbmM1, lcdfTst$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+aucPerf_gbmM3 <-performance(pred_gbmM1, "tpr", "fpr")
+plot(aucPerf_gbmM3)
+
+#AUC value
+aucPerf_gbmM3=performance(pred_gbmM1, "auc")
+aucPerf_gbmM3@y.values
+
+# find index for n trees with minimum CV error
+min_MSE <- which.min(gbm_M3$cv.error)
+
+# get MSE and compute RMSE
+sqrt(gbm_M3$cv.error[min_MSE])
+
+# plot loss function as a result of n trees added to the ensemble
+gbm.perf(gbm_M3, method = "cv")
+
+#confusion matrix
+predTrn=predict(gbm_M3, lcdfTrn,n.tree= bestIter, type='response')
+table(predTrn>0.7,lcdfTrn$loan_status)
+str(lcdf$loan_status)
+
+# model 4
+gbm_M4 <- gbm(formula=unclass(loan_status)-1 ~.,
+              data=subset(lcdfTrn, select=-c(annRet, actualTerm, actualReturn,last_pymnt_d)),
+              distribution = "gaussian",
+              n.trees=200, weights = ifelse(unclass(lcdfTrn$loan_status) > 0, 2, 1),shrinkage=0.1,
+              interaction.depth = 6, bag.fraction=1,cv.folds=5, n.cores=NULL)
+summary(gbm_M4, cBars = 10,method = relative.influence,las = 2)
+
+#summary(gbm_M1)# shows all data
+print(gbm_M4)#shows the model with the parameters
+bestIter<-gbm.perf(gbm_M4, method='cv')
+bestIter # see best iteration
+scores_gbmM4<- predict(gbm_M4, newdata=lcdfTst, n.tree= bestIter,type="response")
+fitted.scores<-ifelse(scores_gbmM4>0,2,1)
+head(scores_gbmM4)# these are the probability for the '1' in the dependent variable
+#Performance - ROC
+
+#label.ordering here specifies the 'negative', 'positive' class labels
+pred_gbmM4=prediction(scores_gbmM4, lcdfTst$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+aucPerf_gbmM4 <-performance(pred_gbmM4, "tpr", "fpr")
+plot(aucPerf_gbmM4)
+
+#AUC value
+aucPerf_gbmM4=performance(pred_gbmM4, "auc")
+aucPerf_gbmM4@y.values
+sqrt(min(gbm_M4$cv.error))
+
+# find index for n trees with minimum CV error
+min_MSE <- which.min(gbm_M3$cv.error)
+# get MSE and compute RMSE
+sqrt(gbm_M4$cv.error[min_MSE])
+# plot loss function as a result of n trees added to the ensemble
+gbm.perf(gbm_M4, method = "cv")
+#confusion matrix
+predTrn=predict(gbm_M4, lcdfTrn,n.tree= bestIter, type='response')
+table(predTrn>0.7,lcdfTrn$loan_status)
+
+#Parameter tuning – automated, using a grid of search values
+paramGrid <- expand.grid( treeDepth = c(2, 5), minNodeSize = c(10, 30), bagFraction = c(.5, .8, 1),
+                          shrinkage = c(.001, .01, .1),
+                          bestTree = 0,minRMSE = 0)
+for (i in 1:nrow(paramGrid)) {
+  gbm_paramTune <-	gbm(formula=actualReturn ~.,data=subset(lcdfTrn, select=-c(annRet, actualTerm, loan_status)),
+                       distribution = 'gaussian', n.trees = 500, interaction.depth = paramGrid$treeDepth[i],
+                       n.minobsinnode = paramGrid$minNodeSize[i], bag.fraction = paramGrid$bagFraction[i],
+                       shrinkage = paramGrid$shrinkage[i], train.fraction = 0.7,n.cores=NULL)
+  
+  #add best tree and its RMSE to paramGrid
+  paramGrid$bestTree[i] <- which.min(gbm_paramTune$valid.error)
+  paramGrid$minRMSE[i] <- sqrt(min(gbm_paramTune$valid.error))
+}
+paramGrid %>% dplyr::arrange(min_MSE)
+head(15)
+paramGrid
+summary(gbm_paramTune)
+bestlter<-gbm.perf(gbm_paramTune)
+bestIter
+
+scores_gbm_paramTune<-predict(gbm_paramTune, newdata=lcdfTst, n.tree= bestlter, type="response")
+head(scores_gbm_paramTune)
+plot.gbm(gbm_paramTune,1,bestlter)
+plot.gbm(gbm_paramTune,2,bestlter)
+plot.gbm(gbm_paramTune,3,bestlter)
+
+
+#individual based on RMSE
+gbm.fit.final<-gbm(loan_status~.,data=subset(lcdfTrn),distribution="gaussian",n.trees=500,
+                   interaction.depth=5,shrinkage=1, n.minobsinnode=30,bag.fraction=1,train.fraction=0.7,
+                   n.cores=NULL)
+summary(gbm.fit.final)
+paramGrid %>% dplyr::arrange(min_MSE)
+paramGrid
+summary(gbm_paramTune)
+bestlter<-gbm.perf(gbm.fit.final)
+bestIter
+scores_gbm.fit.final<-predict(gbm_paramTune, newdata=lcdfTst, n.tree= bestlter, type="response")
+head(scores_gbm_paramTune)
+
+```
+
+
+```{r GLM }
+nr<-nrow(lcdf)
+trnIndex<- sample(1:nr, size = round(0.70*nr), replace=FALSE)
+lcdfTrn <- lcdf[trnIndex, ]
+lcdfTst <- lcdf[-trnIndex, ]
+# xD is the matrix of predictor variables
+xD<-lcdfTrn %>% select(-loan_status, -actualTerm, -annRet, -actualReturn, -last_pymnt_d)
+
+# yD is the response / dependent variable
+yD<- lcdfTrn$loan_status
+
+# For family use binomial for a binary dependent variable
+m1 <- glmnet(data.matrix(xD), yD, family="binomial")
+m2 <- glmnet(data.matrix(xD), yD, family="binomial", alpha = 0)
+m3 <- glmnet(data.matrix(xD), yD, family="binomial", alpha = 0.5)
+m4 <- glmnet(data.matrix(xD), yD, family="binomial", alpha = 1)
+
+
+# num of variables(df), % of deviance explained, λ
+print(m1)
+
+
+# plot of coefficients with varying λ, each curve is for a variable shows coefficients for variables as λ varies
+plot(m1, xvar="lambda")
+plot(m2, xvar="lambda")
+plot(m3, xvar="lambda")
+plot(m4, xvar="lambda")
+
+# perform cross validation to determine best value for λ
+cv_m1<-cv.glmnet(data.matrix(xD), yD, family="binomial", type.measure = "auc") 
+cv_m2<-cv.glmnet(data.matrix(xD), yD, family="binomial", type.measure = "auc", alpha = 0) # alpha = 0 : ridge
+cv_m3<-cv.glmnet(data.matrix(xD), yD, family="binomial", type.measure = "auc", alpha = 0.5) # alpha between 0 and 1 : elastic net
+cv_m4<-cv.glmnet(data.matrix(xD), yD, family="binomial", type.measure = "auc", alpha = 1) # alpha = 1 : lasso
+
+summary(cv_m1$lambda)
+summary(cv_m2$lambda)
+summary(cv_m3$lambda)
+summary(cv_m4$lambda)
+
+cv_m1$lambda.min     # gives lambda with minimum cross validated error
+cv_m2$lambda.min     # gives lambda with minimum cross validated error
+cv_m3$lambda.min     # gives lambda with minimum cross validated error
+cv_m4$lambda.min     # gives lambda with minimum cross validated error
+
+cv_m1$lambda.1se     # gives the most regularized model having error within 1 std error of the min error
+cv_m2$lambda.1se     # gives the most regularized model having error within 1 std error of the min error
+cv_m3$lambda.1se     # gives the most regularized model having error within 1 std error of the min error
+cv_m4$lambda.1se     # gives the most regularized model having error within 1 std error of the min error
+
+# Find AUC values to determine performance for these 4 models
+max(cv_m1$cvm)
+summary(cv_m1$cvm)
+plot(cv_m1$cvm)
+
+max(cv_m2$cvm)
+summary(cv_m2$cvm)
+plot(cv_m2$cvm)
+
+max(cv_m3$cvm)
+summary(cv_m3$cvm)
+plot(cv_m3$cvm)
+
+max(cv_m4$cvm)
+summary(cv_m4$cvm)
+plot(cv_m4$cvm)
+
+
+# Gives the coefficients for the best model based on lambda.1se or lambda.min
+coef(cv_m1, s="lambda.1se") 
+coef(cv_m1, s="lambda.min")
+
+plot(cv_m1)
+plot(cv_m2)
+plot(cv_m3)
+plot(cv_m4)
+
+
+```
+
+```{r Question 2 RFM for Returns}
+# Random Forests for Question 2 ####
+# rf models ####
+set.seed(123)
+rcount<-nrow(lcdf)
+trnIndex<- sample(1:nr, size = round(0.70*nr), replace=FALSE)
+lcdfTrn <- lcdf[trnIndex, ]
+lcdfTst <- lcdf[-trnIndex, ]
+head(lcdfTrn)
+str(lcdfTrn)
+lcdfTrn$loan_status
+
+# Build the RF Model 
+rfModel_Ret <- ranger(actualReturn ~., data=subset(lcdfTrn, select=-c(annRet, actualTerm, loan_status, last_pymnt_d), num.trees =200, importance='permutation'))
+
+# RMSE
+rfPredRet_trn <- predict(rfModel_Ret, lcdfTrn)
+sqrt(mean((rfPredRet_trn$predictions - lcdfTrn$actualReturn)^2))
+
+# Plot the training and testing predictions
+plot((predict(rfModel_Ret, lcdfTst))$predictions, lcdfTst$actualReturn) 
+plot((predict(rfModel_Ret, lcdfTrn))$predictions, lcdfTrn$actualReturn)
+
+#Performance by deciles - Traning and Test
+predRet_Trn <- lcdfTrn %>% select(grade, loan_status, actualReturn, actualTerm, int_rate) %>% mutate(predRet=(predict(rfModel_Ret, lcdfTrn))$predictions)
+predRet_Trn <- predRet_Trn %>% mutate(tile=ntile(-predRet, 10))
+predRet_Trn %>% group_by(tile) %>% summarise(count=n(), avgpredRet=mean(predRet), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(actualReturn), minRet=min(actualReturn), maxRet=max(actualReturn), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B"), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F"),.groups = "keep")
+
+predRet_Tst <- lcdfTst %>% select(grade, loan_status, actualReturn, actualTerm, int_rate) %>% mutate(predRet=(predict(rfModel_Ret, lcdfTst))$predictions)
+predRet_Tst <- predRet_Tst %>% mutate(tile=ntile(-predRet, 10))
+predRet_Tst %>% group_by(tile) %>% summarise(count=n(), avgpredRet=mean(predRet), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(actualReturn), minRet=min(actualReturn), maxRet=max(actualReturn), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B"), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F"),.groups = "keep")
+
+```
+
+```{r XGBM, Return Predictions, GLM for Returns}
+# QUESTION 2
+# Building an xgb model to eventually predict the returns
+#Setting the parameters 
+xgbParams <- list(
+  booster = "gbtree", # or can be "gblinear"
+  objective = "reg:squarederror",
+  eta=0.01, #learning rate
+  #subsample=1, #subsample fraction for training data
+  #for trees
+  max_depth=5,
+  min_child_weight=1,
+  colsample_bytree=1,
+  #for linear models
+  lambda = 0, #L2 regularization for weights
+  alpha = 0, #L1 regularization fo weights
+  lambda_bias=0 #L2 reguralizer for bias term
+)
+
+#Needs all data to be numeric – another way to sconvert categorical (i.e. factor) variables using one-hot encoding
+ohlcdfTrn<- model.matrix(~.+0, data=lcdfTrn %>% select(-c('loan_status'))) #we need to exclude loan_staus in modeling actualReturn
+ohlcdfTst<- model.matrix(~.+0, data=lcdfTst %>% select(-c('loan_status')))
+xgb_Mrcv <- xgb.cv(data=subset(ohlcdfTrn,select=-c(annRet, actualTerm)), label=ohlcdfTrn[,"actualReturn"],
+                    nrounds = 1000, max.depth=4, nfold = 5, eta=0.05, objective="reg:squarederror" )
+
+#Alternately, obtain the Dmatrix object for the training data first and use this multiple times
+dtrain <- xgb.DMatrix(subset(ohlcdfTrn,select=-c(annRet, actualTerm, actualReturn)), label=ohlcdfTrn[,"actualReturn"])
+xgb_Mrcv <- xgb.cv( data = dtrain, nrounds = 1000, max.depth=4, nfold = 5, eta=0.05, objective="reg:squarederror" )
+bestIter<-which.min(xgb_Mrcv$evaluation_log$test_rmse_mean)
+xgb_Mr<- xgb.train( data = dtrain, nrounds = bestIter, max.depth=4, eta=0.05,
+                    objective="reg:squarederror")
+xgb_Mr_importance <- xgb.importance(model = xgb_Mr)
+xgb_Mr_importance %>% view()
+
+# Creating an xgb Model to predict the loan_status probability
+
+#Needs all data to be numeric -- so we convert categorical (i.e. factor) variables #using one-hot encoding – multiple ways to do this
+# use the dummyVars function in the 'caret' package to convert factor variables to # dummy-variables
+fdum<-dummyVars(~.,data=lcdf %>% select(-loan_status))
+dxlcdf <- predict(fdum, lcdf)
+# for loan_status, check levels and convert to dummy vars and drop the second dummy var
+#lcdf$loan_status <- factor(lcdf$loan_status, levels=c("Fully Paid", "Charged Off"))
+#levels(lcdf$loan_status)
+fplcdf <- class2ind(lcdf$loan_status, drop2nd = TRUE)
+#Training, test subsets
+dxlcdfTrn <- dxlcdf[trnIndex,]
+fplcdfTrn <- fplcdf[trnIndex]
+dxlcdfTst <- dxlcdf[-trnIndex,]
+fplcdfTst <- fplcdf[-trnIndex]
+dxTrn <- xgb.DMatrix( subset(dxlcdfTrn, select=-c(annRet, actualTerm, actualReturn)), label=fplcdfTrn)
+dxTst <- xgb.DMatrix( subset(dxlcdfTst, select=-c(annRet, actualTerm, actualReturn)), label=fplcdfTst)
+
+xgbWatchlist <- list(train = dxTrn, eval = dxTst)
+#we can watch the progress of learning thru performance on these datasets
+
+#can specify which evaluation metrics we want to watch
+xgb_lsM1 <- xgb.train(xgbParams, dxTrn, nrounds = 1000,
+                       xgbWatchlist, early_stopping_rounds = 10)
+
+#Stop if performance does not improve after xx rounds
+xgb_lsM1$best_iteration 
+
+#xgb model predictions
+xpredTrg <- predict(xgb_lsM1, dxTrn)
+head(xpredTrg)
+xpredTrgTst <- predict(xgb_lsM1, dxTst)
+head(xpredTrgTst)
+
+#confusion matrix
+table(pred=as.numeric(xpredTrg>0.5), act=fplcdfTrn)
+#ROC, AUC performance
+xpredTst<-predict(xgb_lsM1, dxTst)
+pred_xgb_lsM1=prediction(xpredTst, lcdfTst$loan_status, label.ordering =
+                           c("Charged Off", "Fully Paid"))
+aucPerf_xgb_lsM1=performance(pred_xgb_lsM1, "tpr", "fpr")
+plot(aucPerf_xgb_lsM1)
+abline(a=0, b= 1)
+
+# Models for actualReturn
+xgb_Mr2<- xgboost(data=dtrain, xgbParams, nrounds=962, eta=0.01, subsample=0.7)
+xgbr_Mrcv <- xgb.cv( data = dtrain, nrounds = 1000, max.depth=4, nfold = 5,
+                     eta=0.05, objective="reg:linear" )
+
+bestIter<-which.min(xgbr_Mrcv$evaluation_log$test_rmse_mean)
+xgb.importance(model = xgb_Mr2) %>% view()
+
+
+#Boosting linear models
+xgb_Lin_Rcv <- xgb.cv( data = dtrain, nrounds = 1000, nfold = 5, eta=0.3, subsample=1,
+early_stopping_rounds=10, booster="gblinear", alpha=0.0001 )
+
+xgb_Lin_R1 <- xgboost( data = dtrain, nrounds = xgb_Lin_Rcv$best_iteration,
+eta=0.3, subsample=1, booster="gblinear", alpha=0.0001 )
+xgb.importance(model=xgb_Lin_R1) %>% view()
+
+xgbParamGrid <- expand.grid(
+  max_depth = c(2, 5),
+  eta = c(0.001, 0.01, 0.1) )
+
+xgbParams <- list (
+  booster = "gbtree",
+  objective = "reg:linear",
+  eta=0.01, #learning rate
+  max_depth=5,
+  min_child_weight=1,
+  colsample_bytree=0.6,
+  lambda = 0, #L2 regularization for weights
+  alpha = 0, #L1 regularization fo weights
+  lambda_bias=0 #L2 reguralizer for bias term
+)
+
+for(i in 1:nrow(xgbParamGrid)) {
+  xgb_tune<- xgboost(data=dtrain,objective = "reg:squarederror", nrounds=50, eta=xgbParamGrid$eta[i],
+                     max_depth=xgbParamGrid$max_depth[i], early_stopping_rounds = 10)
+  xgbParamGrid$bestTree[i] <- xgb_tune$evaluation_log[xgb_tune$best_iteration]$iter
+  xgbParamGrid$bestPerf[i] <- xgb_tune$evaluation_log[xgb_tune$best_iteration]$train_rmse
+}
+
+xgb_Mr<- xgboost( data = dtrain, nrounds = bestIter, max.depth=4, eta=0.05, objective="reg:squarederror")
+
+predXgbRet_Trn <- lcdfTrn %>% select(grade, loan_status, actualReturn, actualTerm, int_rate) %>%
+  mutate(predXgbRet=predict(xgb_Mr, subset(ohlcdfTrn,select=-c(annRet, actualTerm, actualReturn))) )
+predXgbRet_Trn <- predXgbRet_Trn %>% mutate(tile=ntile(-predXgbRet, 10))
+predXgbRet_Trn %>% group_by(tile) %>% summarise(count=n(), avgPredRet=mean(predXgbRet), numDefaults=sum(loan_status=="Charged Off"),
+                                                avgActRet=mean(actualReturn), minRet=min(actualReturn), maxRet=max(actualReturn), avgTer=mean(actualTerm), totA=sum(grade=="A"),
+                                                totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") )
+
+# Cross Validation on the Testing Set
+predXgbRet_Tst <- lcdfTst %>% select(grade, loan_status, actualReturn, actualTerm, int_rate) %>%
+  mutate( predXgbRet=predict(xgb_Mr2, subset(ohlcdfTst,select=-c(annRet, actualTerm, actualReturn))) )
+predXgbRet_Tst <- predXgbRet_Tst %>% mutate(tile=ntile(-predXgbRet, 10))
+predXgbRet_Tst %>% group_by(tile) %>% summarise(count=n(), avgPredRet=mean(predXgbRet),
+                                                numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(actualReturn), minRet=min(actualReturn),
+                                                maxRet=max(actualReturn), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B" ),
+                                                totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") ) 
+
+# Another approach is to calculate expectde return by this equation: 
+# Calculate expReturn = (predicted Actual Return)*(prob of Fully Paid) and, sort on this
+
+# Step 1 is considering the top deciles using the probability for out previous models 
+
+# What I'm trying to do here is tie in what we did for #1 with one of our models to the xgb models I'm making for #2. 
+# After this, we 
+pRetSc <- predXgbRet_Tst %>% mutate(poScore=scores_gbmM2)
+pRet_d <- pRetSc %>% filter(tile<=d)
+pRet_d<- pRet_d %>% mutate(tile2=ntile(-poScore, 20))
+pRet_d %>% group_by(tile2) %>% summarise(count=n(), avgPredRet=mean(predXgbRet),
+                                         numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(actualReturn), minRet=min(actualReturn),
+                                         maxRet=max(actualReturn), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B" ),
+                                         totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") )
+
+predXgbRet_Tst <- lcdfTst %>% select(grade, loan_status, actualReturn, actualTerm, int_rate) %>% mutate( predXgbRet=predict(xgbr_Mr, subset(ohlcdfTst,select=-c(annRet, actualTerm, total_pymnt, actualReturn))) ) predXgbRet_Tst <- predXgbRet_Tst %>% mutate(tile=ntile(-predXgbRet, 10)) predXgbRet_Tst %>% group_by(tile) %>% summarise(count=n(), avgPredRet=mean(predXgbRet), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(actualReturn), minRet=min(actualReturn), maxRet=max(actualReturn), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") )
+
+#considering top d decile from M2 pRet_d<- pRet_d %>% mutate(expRet=predXgbRet*poScore) pRet_d<- pRet_d %>% mutate(tile2=ntile(-expRet, 20)) pRet_d %>% group_by(tile2) %>% summarise(count=n(), avgPredRet=mean(predXgbRet), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(actualReturn), minRet=min(actualReturn), maxRet=max(actualReturn), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") )
+
+# Modeling loan_status on lower grade loans - rf (ranger)
+# This should be useful for #4 
+lg_lcdfTst<-lcdfTst %>% filter(grade=='C'| grade=='D'| grade== 'E'| grade== 'F'| grade== 'G') rf_M1_lg <- ranger(loan_status ~., data=subset(lg_lcdfTrn, select=-c(annRet, actualTerm, actualReturn)), num.trees =200, probability=TRUE, importance='permutation') lg_scoreTstRF <- lg_lcdfTst %>% select(grade, loan_status, actualReturn, actualTerm, int_rate) %>% mutate(score=(predict(rf_M1_lg,lg_lcdfTst))$predictions[,"Fully Paid"]) lg_scoreTstRF <- lg_scoreTstRF %>% mutate(tile=ntile(-score, 10)) lg_scoreTstRF %>% group_by(tile) %>% summarise(count=n(), avgSc=mean(score), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(actualReturn), minRet=min(actualReturn), maxRet=max(actualReturn), avgTer=mean(actualTerm), totA=sum(grade=="A"), totB=sum(grade=="B" ), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F") )
+
+# GLM for Returns
+# xD is the matrix of predictor variables
+xDRet<-lcdfTrn %>% select(-loan_status, -actualTerm, -annRet, -actualReturn, -last_pymnt_d)
+
+# yD is the response / dependent variable
+yDRet<- lcdfTrn$actualReturn
+
+# For family use binomial for a binary dependent variable
+m2Ret <- glmnet(data.matrix(xDRet), yDRet, family="gaussian", alpha = 0)
+m4Ret <- glmnet(data.matrix(xDRet), yDRet, family="gaussian", alpha = 1)
+
+
+# num of variables(df), % of deviance explained, λ
+print(m2Ret)
+
+
+# plot of coefficients with varying λ, each curve is for a variable shows coefficients for variables as λ varies
+plot(m2Ret, xvar="lambda")
+plot(m4Ret, xvar="lambda")
+
+# perform cross validation to determine best value for λ
+cv_m2Ret<-cv.glmnet(data.matrix(xDRet), yDRet, family="gaussian", alpha = 0) # alpha = 0 : ridge
+cv_m4Ret<-cv.glmnet(data.matrix(xDRet), yDRet, family="gaussian", alpha = 1) # alpha = 1 : lasso
+
+summary(cv_m2Ret$lambda)
+summary(cv_m4Ret$lambda)
+
+cv_m2Ret$lambda.min     # gives lambda with minimum cross validated error
+cv_m4Ret$lambda.min     # gives lambda with minimum cross validated error
+
+cv_m2Ret$lambda.1se     # gives the most regularized model having error within 1 std error of the min error
+cv_m4Ret$lambda.1se     # gives the most regularized model having error within 1 std error of the min error
+
+# Find AUC values to determine performance for these 4 models
+max(cv_m2Ret$cvm)
+summary(cv_m2Ret$cvm)
+plot(cv_m2Ret$cvm)
+
+max(cv_m4Ret$cvm)
+summary(cv_m4Ret$cvm)
+plot(cv_m4Ret$cvm)
+
+
+# Gives the coefficients for the best model based on lambda.1se or lambda.min
+coef(cv_m4Ret, s="lambda.1se") 
+coef(cv_m4Ret, s="lambda.min")
+
+plot(cv_m2Ret)
+plot(cv_m4Ret)
+
+```
+
+
+```{r Summaries and Lower Grade Analysis}
+# Create the new Lower Grade (LG) datasets
+lcdfTrnLG <- filter(lcdfTrn, lcdfTrn$grade == "C"|lcdfTrn$grade == "D"|lcdfTrn$grade == "E"|lcdfTrn$grade == "F"|lcdfTrn$grade == "G")
+lcdfTstLG <- filter(lcdfTst, lcdfTst$grade == "C"|lcdfTst$grade == "D"|lcdfTst$grade == "E"|lcdfTst$grade == "F"|lcdfTst$grade == "G")
+
+# GBM's for Lower Grades
+gbm_M4LG <- gbm(formula=unclass(loan_status)-1 ~.,
+              data=subset(lcdfTrnLG, select=-c(annRet, actualTerm, actualReturn,last_pymnt_d)),
+              distribution = "gaussian",
+              n.trees=200, weights = ifelse(unclass(lcdfTrnLG$loan_status) > 0, 2, 1),shrinkage=0.1,
+              interaction.depth = 6, bag.fraction=1,cv.folds=5, n.cores=NULL)
+summary(gbm_M4LG, cBars = 10,method = relative.influence,las = 2)
+
+print(gbm_M4LG)#shows the model with the parameters
+bestIter<-gbm.perf(gbm_M4LG, method='cv')
+bestIter # see best iteration
+scores_gbmM4LG<- predict(gbm_M4LG, newdata=lcdfTstLG, n.tree= bestIter,type="response")
+fitted.scores<-ifelse(scores_gbmM4LG>0,2,1)
+head(scores_gbmM4LG)# these are the probability for the '1' in the dependent variable
+#Performance - ROC
+
+#label.ordering here specifies the 'negative', 'positive' class labels
+pred_gbmM4LG=prediction(scores_gbmM4LG, lcdfTstLG$loan_status, label.ordering = c("Charged Off", "Fully Paid"))
+aucPerf_gbmM4LG <-performance(pred_gbmM4LG, "tpr", "fpr")
+plot(aucPerf_gbmM4LG)
+
+#AUC value
+aucPerf_gbmM4LG=performance(pred_gbmM4, "auc")
+aucPerf_gbmM4LG@y.values
+sqrt(min(gbm_M4LG$cv.error))
+
+# plot loss function as a result of n trees added to the ensemble
+gbm.perf(gbm_M4LG, method = "cv")
+
+#confusion matrix
+predTrnLG=predict(gbm_M4LG, lcdfTrnLG,n.tree= bestIter, type='response')
+table(predTrnLG>0.7,lcdfTrnLG$loan_status)
+
+# GLM's
+# xD is the matrix of predictor variables
+xDLG<-lcdfTrnLG %>% select(-loan_status, -actualTerm, -annRet, -actualReturn, -last_pymnt_d)
+
+# yD is the response / dependent variable
+yDLG<- lcdfTrnLG$loan_status
+
+m4LG <- glmnet(data.matrix(xDLG), yDLG, family="binomial", alpha = 1)
+
+cv_m4LG<- cv.glmnet(data.matrix(xDLG), yDLG, family="binomial", type.measure = "auc", alpha = 1)
+
+plot(m4LG, xvar="lambda")
+
+# AUC Summery / Plot
+max(cv_m4LG$cvm)
+summary(cv_m4LG$cvm)
+plot(cv_m4LG$cvm)
+
+
+coef(cv_m4, s="lambda.1se") 
+coef(cv_m4, s="lambda.min")
+plot(cv_m4)
+
+# Random Forest
+rfModel_RetLG <- ranger(actualReturn ~., data=subset(lcdfTrnLG, select=-c(annRet, actualTerm, loan_status, last_pymnt_d), num.trees =200, importance='permutation'))
+
+rfPredRet_trnLG <- predict(rfModel_Ret, lcdfTrnLG)
+sqrt(mean( (rfPredRet_trnLG$predictions - lcdfTrnLG$actualReturn)^2))
+#sqrt(mean( ( (predict(rfModel_Ret, lcdfTst))$predictions - lcdfTst$actualReturn)^2))
+
+plot((predict(rfModel_RetLG, lcdfTstLG))$predictions, lcdfTstLG$actualReturn) 
+plot((predict(rfModel_RetLG, lcdfTrnLG))$predictions, lcdfTrnLG$actualReturn)
+
+#Performance by deciles
+predRet_TrnLG <- lcdfTrnLG %>% select(grade, loan_status, actualReturn, actualTerm, int_rate) %>% mutate(predRet=(predict(rfModel_Ret, lcdfTrnLG))$predictions)
+predRet_TrnLG <- predRet_TrnLG %>% mutate(tile=ntile(-predRet, 10))
+predRet_TrnLG %>% group_by(tile) %>% summarise(count=n(), avgpredRet=mean(predRet), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(actualReturn), minRet=min(actualReturn), maxRet=max(actualReturn), avgTer=mean(actualTerm), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F"),.groups = "keep" )
+
+predRet_TstLG <- lcdfTstLG %>% select(grade, loan_status, actualReturn, actualTerm, int_rate) %>% mutate(predRet=(predict(rfModel_Ret, lcdfTstLG))$predictions)
+predRet_TstLG <- predRet_TstLG %>% mutate(tile=ntile(-predRet, 10))
+predRet_TstLG %>% group_by(tile) %>% summarise(count=n(), avgpredRet=mean(predRet), numDefaults=sum(loan_status=="Charged Off"), avgActRet=mean(actualReturn), minRet=min(actualReturn), maxRet=max(actualReturn), avgTer=mean(actualTerm), totC=sum(grade=="C"), totD=sum(grade=="D"), totE=sum(grade=="E"), totF=sum(grade=="F"),.groups = "keep" )
+
+
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
