@@ -1,0 +1,1 @@
+The code file attached studies question 4 of Assignment 1. Question 4 includes linear regression on the Auto dataset; more specifically, it goes in depth on the relationship between the variables, visualizations, and the fit with each residual present in the graph.  
