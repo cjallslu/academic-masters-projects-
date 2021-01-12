@@ -1,0 +1,1 @@
+Lab 5 consisted of calculating the degree centrality and alpha values (alpha_0 & alpha_1 values to be more specific) for 3 separate datasets
