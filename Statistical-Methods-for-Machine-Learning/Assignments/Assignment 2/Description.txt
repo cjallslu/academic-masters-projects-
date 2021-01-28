@@ -1,0 +1,2 @@
+The code files attached study questions 2 and 5 of Assignment 2. Question 4 includes linear regression on the ISLR dataset; logistic regression models are created, and the accuracy + different measures are taken using confusion matrices. 
+  
