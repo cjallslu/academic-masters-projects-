@@ -1,0 +1,1 @@
+Homework 3 combines both SparkDataframe, and SQL Transformations working with a Twitter dataset. The ultimate goal of this assignment is to map out the frequent users within the data, and get their information in an efficient and accurate manner. 
