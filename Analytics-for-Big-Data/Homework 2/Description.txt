@@ -1,0 +1,1 @@
+Homework 2 primarily focuses on SparkRDD operations on Twitter posts. The goal is to be able to map out how many times a Tweet appeared, then display the number of times that instance occurs. 
