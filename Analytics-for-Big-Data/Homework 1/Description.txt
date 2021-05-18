@@ -1,0 +1,1 @@
+Homework 1 mimics the process of different MapReduce tasks. The end goal is to be able to count the number of times each word appears within the document from each kay-value pair. 
