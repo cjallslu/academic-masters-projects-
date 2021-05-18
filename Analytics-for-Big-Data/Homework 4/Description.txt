@@ -1,0 +1,1 @@
+Homework 4 is a choice between building a recommender system, and k-means. Our team decided to go with the k-means choice: this choice takes the Iris dataset, and aims to accurately classify each species of iris using k-means and improving on the previous models. 
