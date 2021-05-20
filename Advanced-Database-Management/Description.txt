@@ -1,0 +1,6 @@
+Advanced Database Management is a class that examines these topics: 
+(a) OLTP database design, SQL, indexing, and query evaluation; 
+(b) OLAP dimensional database design, Extract-Transform-Load process, OLAP cubes; and 
+(c) NoSQL databases. 
+
+The files included within this folder go over the details of what I've learned using SQL 
